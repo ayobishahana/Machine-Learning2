@@ -1,0 +1,287 @@
+---
+title: "HW2-DIGIT-RECOGNIZER"
+author: "Shahana Ayobi"
+date: '2023-04-08'
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+
+An appropriate metric to evaluate the models would be accuracy, since it giives the percentage of correctly classified images out of the total images. Since we are interested to classify the images into one of the ten digits, accuracy would be a good measure in predicting the correct category labels. Mean per class error can also be a plausible metric for this task since it takes into account the performance of the models on each individual digit category. Thus, it will provide a more nuanced evaluation of the model performance since it provides the average error rate across all categories of digits where the error rate is the ratio of misclassified observations over the total. Thus, for this specific task, I will be using mean class per error.
+
+The dataset was retrieved from Kaggle's Digit Recognizer competition website. we have the same basic images, 28*28 grayscale, that have 784 pixels, and 60000 images. The data was then normalized by dividing the pixels by 255. The first 1-784 columns are pixels and the last column is the label that includes 10 digit labels, from 0-9. An example of digits is shown as below:
+
+```{r loading packages, message=FALSE, include=FALSE}
+library(h2o)
+h2o.init()
+library(tidyverse)
+library(tensorflow)
+library(reticulate)
+reticulate::use_virtualenv("r-reticulate")
+library(data.table)
+library(R.utils)
+library(kableExtra)
+```
+
+
+
+```{r loading data, message=FALSE}
+# download data from http://yann.lecun.com/exdb/mnist/
+download.file("http://yann.lecun.com/exdb/mnist/train-images-idx3-ubyte.gz",
+              "train-images-idx3-ubyte.gz")
+download.file("http://yann.lecun.com/exdb/mnist/train-labels-idx1-ubyte.gz",
+              "train-labels-idx1-ubyte.gz")
+download.file("http://yann.lecun.com/exdb/mnist/t10k-images-idx3-ubyte.gz",
+              "t10k-images-idx3-ubyte.gz")
+download.file("http://yann.lecun.com/exdb/mnist/t10k-labels-idx1-ubyte.gz",
+              "t10k-labels-idx1-ubyte.gz")
+
+# gunzip the files
+R.utils::gunzip("train-images-idx3-ubyte.gz")
+R.utils::gunzip("train-labels-idx1-ubyte.gz")
+R.utils::gunzip("t10k-images-idx3-ubyte.gz")
+R.utils::gunzip("t10k-labels-idx1-ubyte.gz")
+
+# load label files
+load_label_file <- function(filename) {
+  f <- file(filename, 'rb')
+  readBin(f, 'integer', n = 1, size = 4, endian = 'big')
+  n <- readBin(f, 'integer', n = 1, size = 4, endian = 'big')
+  y <- readBin(f, 'integer', n = n, size = 1, signed = FALSE)
+  close(f)
+  y
+}
+
+# load image files
+load_image_file <- function(filename) {
+  ret <- list()
+  f <- file(filename, 'rb')
+  readBin(f, 'integer', n = 1, size = 4, endian = 'big')
+  n    <- readBin(f, 'integer', n = 1, size = 4, endian = 'big')
+  nrow <- readBin(f, 'integer', n = 1, size = 4, endian = 'big')
+  ncol <- readBin(f, 'integer', n = 1, size = 4, endian = 'big')
+  x <- readBin(f, 'integer', n = n * nrow * ncol, size = 1, signed = FALSE)
+  close(f)
+  as.data.frame(matrix(x/255, ncol = nrow * ncol, byrow = TRUE))
+}
+
+
+# load images
+train <- load_image_file("train-images-idx3-ubyte")
+test <- load_image_file("t10k-images-idx3-ubyte")
+
+# load labels
+train$label <- as.factor(load_label_file("train-labels-idx1-ubyte")) 
+test$label <- as.factor(load_label_file("t10k-labels-idx1-ubyte"))
+
+
+# convert data to h2o frames
+train_h2o <- as.h2o(train)
+dmnist_test <- as.h2o(test)
+
+
+
+show_digit = function(arr784, col = gray(12:1 / 12), ...) {
+  image(matrix(as.matrix(arr784[-785]), nrow = 28)[, 28:1], col = col, ...)
+}
+
+show_digits = function(arr_list, ncol = 3, ...) {
+  nrow = ceiling(length(arr_list) / ncol)
+  par(mfrow = c(nrow, ncol))
+  for (i in 1:length(arr_list)) {
+    show_digit(arr_list[[i]], ...)
+  }
+  par(mfrow = c(1, 1))
+}
+train_x <- train[,1:784]
+image_list <- lapply(1:12, function(i) train_x[i, ])
+
+show_digits(image_list, ncol = 4)
+
+```
+
+To quicken up the learning process, I am only using 20% of the data, and then splitting it into 80% and the rest 20% as validation set.
+
+```{r spliting data, message=FALSE}
+my_seed <- 20230406
+dmnist_data_small <- slice_sample(train, prop = 0.2)
+
+data_split <- h2o.splitFrame(as.h2o(dmnist_data_small), ratios = 0.8, seed = my_seed)
+dmnist_train <- data_split[[1]]
+dmnist_holdout <- data_split[[2]]
+```
+
+The simple learning model only uses one hidden layer with 16 nodes, the plot shows that logloss is constantly decreasing for this model. The other five models are as below:
+
+Model 1: The model has two hidden layers with 16 nodes each, with a mini batch size of 20, it is trained with 70 epochs. It is trying to learn a good representation of input data by adjusting bias and weights of network.
+
+Model 2: This model used RectifierWithDropout activation function with hidden drop out ratio of 0.2. The aim in here is to reduce overfitting by dropping some neurons randomly. 
+
+Model 3: This model is trained with 100 epochs, the score each parameter is is set to True meaning that model's performance is evaluated in each iteration. The aim is to evaluate the model performance more frequently and learn a better representation of input data by training the model for longer.
+
+Model 4: This model is quite similar to model 3, but in here, I am adding L1 regularization with a coefficient of 0.0001. The purpose of this model is to decrease complexity of the model by setting some weights closer or equal to zero in order to prevent overfitting.
+
+Model 5: This model uses dropout ration with 0.2, and two types of regularizations; L1, and L2 with coefficients of 0.001. The aim is to encourage the weights to be small, and prevent overfitting. 
+
+```{r simple dl with one hidden layer, message=FALSE, warning=FALSE}
+dmnist_dl_simple <- h2o.deeplearning(
+    x = 1:784,
+    y = "label",
+    training_frame = dmnist_train,
+    validation_frame = dmnist_holdout,
+    model_id = "dmnist_dl_simple",
+    hidden = 16,
+    seed = my_seed
+)
+cm_simple <- h2o.confusionMatrix(dmnist_dl_simple, valid = TRUE)
+plot(dmnist_dl_simple, metric = "logloss")
+
+```
+
+
+```{r adjusted dl model 1, message=FALSE, warning=FALSE}
+dmnist_dl_model1 <- h2o.deeplearning(
+    x = 1:784,
+    y = "label",
+    training_frame = dmnist_train,
+    validation_frame = dmnist_holdout,
+    model_id = "dmnist_dl_model1",
+    hidden = c(16, 16),
+    epochs = 70,
+    mini_batch_size = 20,
+    score_each_iteration = TRUE,
+    seed = my_seed
+)
+plot(dmnist_dl_model1, metric = "classification_error")
+history_m1 <- h2o.scoreHistory(dmnist_dl_model1)
+
+```
+
+
+```{r adjusted dl model 2, message=FALSE, warning=FALSE}
+dmnist_dl_model2 <- h2o.deeplearning(
+    x = 1:784,
+    y = "label",
+    training_frame = dmnist_train,
+    validation_frame = dmnist_holdout,
+    model_id = "dmnist_dl_model3",
+    activation = "RectifierWithDropout",
+    hidden_dropout_ratios = c(0.2, 0.2),
+    epochs = 70,
+    seed = my_seed  
+)
+plot(dmnist_dl_model2, metric = "classification_error")
+history_m2 <- h2o.scoreHistory(dmnist_dl_model2)
+
+```
+
+
+
+
+```{r adjusted dl model 3, message=FALSE, warning=FALSE}
+dmnist_dl_model3 <- h2o.deeplearning(
+    x = 1:784,
+    y = "label",
+    training_frame = dmnist_train,
+    validation_frame = dmnist_holdout,
+    model_id = "dmnist_dl_model2",
+    hidden = c(16, 16),
+    mini_batch_size = 20,
+    activation = "RectifierWithDropout",
+    hidden_dropout_ratios = c(0.2, 0.2),
+    epochs = 100,
+    score_each_iteration = TRUE,
+    seed = my_seed
+)
+plot(dmnist_dl_model3, metric = "classification_error")
+history_m3 <- h2o.scoreHistory(dmnist_dl_model3)
+
+```
+
+
+```{r adjusted dl model 4, message=FALSE, warning=FALSE}
+dmnist_dl_model4<- h2o.deeplearning(
+    x = 1:784,
+    y = "label",
+    training_frame = dmnist_train,
+    validation_frame = dmnist_holdout,
+    model_id = "dmnist_dl_model4",
+    activation = "RectifierWithDropout",
+    mini_batch_size= 20,
+    hidden_dropout_ratios = c(0.2, 0.2), 
+    l1 = 0.0001,
+    epochs = 300,
+    score_each_iteration = TRUE,
+    seed = my_seed,
+)
+plot(dmnist_dl_model4, metric = "classification_error")
+history_m4 <- h2o.scoreHistory(dmnist_dl_model4)
+
+```
+
+
+```{r adjusted dl model 5, message=FALSE, warning=FALSE}
+dmnist_dl_model5<- h2o.deeplearning(
+    x = 1:784,
+    y = "label",
+    training_frame = dmnist_train,
+    validation_frame = dmnist_holdout,
+    model_id = "dmnist_dl_model5",
+    mini_batch_size = 20,
+    activation = "RectifierWithDropout", 
+    input_dropout_ratio = 0.2,
+    l1 = 0.001,
+    l2 = 0.001,
+    epochs = 300,
+    score_each_iteration = TRUE,
+    seed = my_seed
+)
+plot(dmnist_dl_model5, metric = "classification_error")
+history_m5 <- h2o.scoreHistory(dmnist_dl_model5)
+
+```
+
+The table below shows that the lowest mean per class error with a value of 4.04% which is indeed a good indication that it generalizes well to the new data. However, the model is using L1 regularization that can make the model interpretation difficult. Model 2 that uses dropout of 0.2 to prevent overfitting, also performs very well with mean class per error of 4.83% for the validation set. This model is simpler and easier to interpret, it also takes lesser time to run, therefore, I will chose model 2.
+
+```{r results, echo=FALSE, message=FALSE, warning=FALSE}
+# Create a data frame for the mean per class error
+error_df <- data.frame(Model = c("DMNIST Simple DL", "Model 1", "Model 2", "Model 3", "Model 4", "Model 5"),
+                       Train_Mean_Per_Class_Error = c(h2o.mean_per_class_error(dmnist_dl_simple, train = TRUE),
+                                                      h2o.mean_per_class_error(dmnist_dl_model1, train = TRUE),
+                                                      h2o.mean_per_class_error(dmnist_dl_model2, train = TRUE),
+                                                      h2o.mean_per_class_error(dmnist_dl_model3, train = TRUE),
+                                                      h2o.mean_per_class_error(dmnist_dl_model4, train = TRUE),
+                                                      h2o.mean_per_class_error(dmnist_dl_model5, train = TRUE)),
+                       Valid_Mean_Per_Class_Error = c(h2o.mean_per_class_error(dmnist_dl_simple, valid = TRUE),
+                                                      h2o.mean_per_class_error(dmnist_dl_model1, valid = TRUE),
+                                                      h2o.mean_per_class_error(dmnist_dl_model2, valid = TRUE),
+                                                      h2o.mean_per_class_error(dmnist_dl_model3, valid = TRUE),
+                                                      h2o.mean_per_class_error(dmnist_dl_model4, valid = TRUE),
+                                                      h2o.mean_per_class_error(dmnist_dl_model5, valid = TRUE)))
+
+
+# Print the data frame
+kable(error_df) %>% kable_styling(latex_options = c("HOLD_position", "resizebox=2.5\\textwidth"), font_size = 12, full_width = T)
+
+```
+
+
+
+
+Since I chose model 2, I evaluated on the test set in order to compare the validation error with test error. Here, the model performs well for the test set with mean per class  error of 4.74% which is lesser than the validation error meaning that the model generalizes well to the new data.
+
+```{r evaluation, message=FALSE, warning=FALSE}
+# Evaluate the model on the test set
+perf <- h2o.performance(dmnist_dl_model2, newdata = dmnist_test)
+
+# Get mean per class error and accuracy
+mean_per_class_error <- h2o.mean_per_class_error(perf)
+
+mean_per_class_error
+
+
+```
+

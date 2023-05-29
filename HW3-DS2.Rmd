@@ -1,0 +1,525 @@
+---
+title: "HW3-ML2"
+author: "Shahana Ayobi"
+date: '2023-04-17'
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, cache = TRUE)
+```
+
+```{r loading packages, include=FALSE}
+library(tidyverse)
+library(data.table)
+library(caret)
+library(MLmetrics)
+library(kableExtra)
+library(corrplot)
+library(dplyr)
+library(pROC)
+library(ranger)
+library(glmnet)
+library(mlr)
+library(xgboost)
+library(h2o)
+h2o.init()
+```
+
+
+## Introduction
+
+This dataset summarizes a heterogeneous set of features about articles published by Mashable in a period of two years. The goal is to predict if the article is among the most popular ones based on sharing on social networks (coded by the variable is_popular which was created from the original shares variable in a way that is intentionally undisclosed).
+
+```{r loading datasets, message=FALSE}
+train <- read_csv("online-news-popularity-ceu-ml2-a3-2023/train.csv")
+test <- read_csv("online-news-popularity-ceu-ml2-a3-2023/test.csv")
+```
+
+Before going on to building models, I checked whether the train and test datasets have any duplicates or missing values. The datasets seem appropriate for modeling at the first glance with no missing or duplicate values.
+
+```{r}
+any(duplicated(train))
+any(colSums(is.na(train)))
+any(duplicated(test))
+any(colSums(is.na(test)))
+```
+
+Looking at the structure of the variables, all of them are characterized as doubles. However, we have both numeric and binary variables; thus, the variables need to be adjusted accordingly. To start with the the response variable, the data is imbalanced and we have only 3,377 news articles characterized as popular out of 29,733. I have also factored the response variable to correctly classify the two classes.
+
+```{r message=FALSE}
+# Checking the count of popular vs unpopular articles.
+train %>% 
+   group_by(is_popular) %>% 
+   summarise(cnt = n()) %>% kable() %>% kable_styling(latex_options = c("HOLD_position", "resizebox=2.5\\textwidth"), font_size = 14, full_width = F)
+
+# changing the response variable to factor and dropping non-predictive variables
+
+train <- train %>% mutate("is_popular" = factor(is_popular)) %>% select(-c(article_id, timedelta))
+test <- test %>% select(-c(timedelta))
+
+
+```
+
+The data is split into train and test sets, 80% is assigned to training, and the rest to test set for evaluation.
+
+```{r splitting the data, message=FALSE}
+# Splitting the data
+my_seed <- 20230418
+set.seed(my_seed)
+n_obs <- nrow(train)
+test_share <- 0.20
+
+test_indices <- sample(seq(n_obs), floor(test_share * n_obs))
+news_test <- train[test_indices, ]
+news_train <- train[-test_indices, ]
+# Convert data frames to H2OFrame
+news_train_h2o <- as.h2o(news_train)
+news_test_h2o <- as.h2o(news_test)
+test_h2o <- as.h2o(test)
+```
+
+### Benchmark model: Simple Logit Model
+
+For the benchmark, I am running simple logit model. To get the Area Under the Roc (AUC) curve for this binary classification model, I am creating a function that takes two arguments; `prediction`, the predicted probabilities or scores from the model for the positive class and `y_obs`, the true binary labels for the positive class, and then uses the `roc` function to calculate the AUC.
+```{r AUC function}
+calculateAUC <- function(prediction, y_obs) {
+  roc_obj <- roc(y_obs, prediction)
+  auc_val <- auc(roc_obj)
+  return(auc_val)
+}
+
+```
+
+The simple logit model yields an AUC of 0.6970961	for the training set and 0.7037293 for the remaining test set. testing the model on test set and submitting the result on Kaggle, I get a score of 0.66915 for this model.
+
+```{r simple logit model, message=FALSE}
+# create formula and fit glm model
+vars <- names(news_train[,1:(length(news_train)-1)])
+formula <- formula(paste0("is_popular ~", paste0(vars, collapse = " + ")))
+logit_model <- glm(formula = formula, data = news_train, family = binomial)
+
+
+# add AUC results to table
+auc_result <- tibble(
+  model = "Logit Model",
+  train = calculateAUC(predict(logit_model, news_train), news_train$is_popular),
+  test = calculateAUC(predict(logit_model, news_test), news_test$is_popular)
+)
+kable(auc_result) %>% kable_styling(latex_options = c("HOLD_position", "resizebox=2.5\\textwidth"), font_size = 14, full_width = T)
+
+# Make predictions on test set
+test_prob <- predict(logit_model, newdata = test, type = "response")
+
+# Create data frame with article IDs and predicted probabilities
+submission <- data.frame(article_id = test$article_id, score = test_prob)
+
+# Write submission file to CSV
+write.csv(submission, "logit_submission.csv", row.names = FALSE)
+
+
+```
+
+## Feature Engineering
+
+Also, there are 930 articles where the number of words in the content (n_tokens_content) are zero, I will drop those rows to reduce the noise in data, and characterize news articles to those that have some textual content. Now, the total number of observations is 28,803.
+Looking at the correlation plots among polarity, keyword, and word variables, most of the polarity features record the same values, therefore, as shown above, they tend to have high correlation. To avoid over fitting the model, it makes more sense to keep the variables recording the averages and drop the max and mins. The same is true for keyword measures.
+
+After looking at the tokens and words related features in the dataset,  it can be concluded that correlation between rate of non-stop words, rate of unique non-stop words and rate of unique words is extremely high. I have decided to drop rate of non-stop words and rate of unique non-stop words.
+```{r feature engineering, message=FALSE}
+# Dropping the articles with zero token
+train <- news_train %>% 
+  filter(n_tokens_content != 0)
+# Creating a function that factorizes the binary variables.
+factor_func <- function(x) { 
+  x %>%
+    mutate(across(c(
+      starts_with("data_channel_is_"),
+      starts_with("weekday_is_"),
+      "is_weekend"
+    ), factor))
+}
+
+news_train <- factor_func(news_train)
+news_test <- factor_func(news_test)
+test <- factor_func(test)
+# Select the variables you want to calculate correlations for
+polarity_vars <- c("avg_positive_polarity","min_positive_polarity","max_positive_polarity",
+                   "avg_negative_polarity","min_negative_polarity","max_negative_polarity")
+keyword_vars <- c("kw_min_min", "kw_max_min", "kw_avg_min", 
+                  "kw_min_max", "kw_max_max", "kw_avg_max",
+                  "kw_min_avg", "kw_max_avg", "kw_avg_avg")
+word_vars <- c("n_tokens_title", "n_tokens_content", 
+               "n_unique_tokens", "n_non_stop_words", 
+               "n_non_stop_unique_tokens")
+
+
+# Calculate the correlation matrices
+polarity_cor <- cor(news_train[, polarity_vars])
+keyword_cor <- cor(news_train[, keyword_vars])
+word_cor <- cor(news_train[, word_vars])
+
+# Create the correlation plots
+corrplot(polarity_cor, type = "upper", method = "circle")
+corrplot(keyword_cor, type = "upper", method = "circle")
+corrplot(word_cor, type = "upper", method = "circle")
+
+to_drop <- c("kw_min_min", "kw_max_min", 
+             "kw_avg_min", "kw_min_max", 
+             "kw_max_max", "kw_avg_max", 
+             "kw_min_avg", "kw_max_avg", "self_reference_min_shares", 
+             "self_reference_max_shares", "is_weekend", "rate_negative_words","min_positive_polarity", 
+             "max_positive_polarity", "min_negative_polarity", "max_negative_polarity", "n_non_stop_words", 
+               "n_non_stop_unique_tokens")
+news_train <- news_train %>%
+  select(-one_of(to_drop))
+
+news_test <- news_test%>%
+  select(-one_of(to_drop))
+
+test <- test%>%
+  select(-one_of(to_drop))
+
+```
+### Logit Model Engineered
+The feature Engineered model AUC did not improve, and the AUC decreases to 0.6920884 for the test set.
+
+```{r logit engineered, message=FALSE}
+# create formula and fit glm model
+vars <- names(news_train[,1:(length(news_train)-1)])
+formula <- formula(paste0("is_popular ~", paste0(vars, collapse = " + ")))
+logit_model_eng <- glm(formula = formula, data = news_train, family = binomial)
+
+
+# add AUC results to table
+auc_results <- tibble(
+  model = "Logit Model Engineered",
+  train = as.numeric(unname(calculateAUC(predict(logit_model_eng, news_train), news_train$is_popular))),
+  test = as.numeric(unname(calculateAUC(predict(logit_model_eng, news_test), news_test$is_popular)))
+)
+
+kable(auc_results) %>% kable_styling(latex_options = c("HOLD_position", "resizebox=2.5\\textwidth"), font_size = 12, full_width = T)
+# Make predictions on test set
+test_prob <- predict(logit_model_eng, newdata = test, type = "response")
+
+# Create data frame with article IDs and predicted probabilities
+submission <- data.frame(article_id = test$article_id, score = test_prob)
+
+# Write submission file to CSV
+write.csv(submission, "logit_eng_submission.csv", row.names = FALSE)
+
+```
+
+### Lasso Model
+
+I then fitted a lasso model using cross validation on both test and train sets. I have used Lasso to be able to perform variable selection in order to shrink some coefficients to zero if they are not important for prediction. The Lasso model yields an AUC of 0.6919855 which is still worse than the Logit Engineered model.
+
+
+```{r lasso model, message=FALSE}
+# create formula and fit Lasso model
+vars <- names(news_train[,1:(length(news_train)-1)])
+formula <- formula(paste0("is_popular ~", paste0(vars, collapse = " + ")))
+X_train <- model.matrix(formula, data = news_train)[,-1]
+y_train <- news_train$is_popular
+X_test <- model.matrix(formula, data = news_test)[,-1]
+y_test <- news_test$is_popular
+
+# fit Lasso model
+lasso_model <- cv.glmnet(X_train, y_train, family = "binomial", alpha = 1)
+
+# calculate AUC on training and test sets
+train_prob <- predict(lasso_model, newx = X_train, s = lasso_model$lambda.min, type = "response")
+test_prob <- predict(lasso_model, newx = X_test, s = lasso_model$lambda.min, type = "response")
+train_auc <- as.numeric(calculateAUC(train_prob, y_train))
+test_auc <- as.numeric(calculateAUC(test_prob, y_test))
+
+# add AUC results to table
+auc_results <- add_row(auc_results,
+  model = "Lasso Model",
+  train = train_auc,
+  test = test_auc
+)
+
+kable(auc_results) %>% kable_styling(latex_options = c("HOLD_position", "resizebox=2.5\\textwidth"), font_size = 12, full_width = T)
+```
+
+### Random Forest Model
+
+I then ran a random forest model with 100 trees, maximum depth of 8, and minimum node size of 100. Introducing these tunings  improved my test AUC, and now it yields an AUC score of 0.7130621, and the kaggle submission gives a score of 0.68652.
+```{r random forest, message=FALSE}
+# fit Random Forest model
+rf_model <- ranger(is_popular ~ ., data = news_train,
+                    probability = TRUE, num.trees = 100, num.threads = 1, 
+                   mtry = sqrt(ncol(news_train)), max.depth = 8, min.node.size = 100)
+
+# calculate AUC on training and test sets
+train_prob <- predict(rf_model, data = news_train)$predictions[,2]
+test_prob <- predict(rf_model, data = news_test)$predictions[,2]
+train_auc <- as.numeric(calculateAUC(train_prob, y_train))
+test_auc <- as.numeric(calculateAUC(test_prob, y_test))
+auc_results$train <- as.numeric(auc_results$train)
+auc_results$test <- as.numeric(auc_results$test)
+
+# add AUC results to table
+auc_results <- add_row(auc_results,
+  model = "Random Forest",
+  train = train_auc,
+  test = test_auc
+)
+kable(auc_results) %>% kable_styling(latex_options = c("HOLD_position", "resizebox=2.5\\textwidth"), font_size = 12, full_width = T)
+# Make predictions on test data
+test_pred <- predict(rf_model, data= test)$predictions[,2]
+
+
+# Create submission file with two columns
+submission_r <- data.frame(article_id = test$article_id, score = test_pred)
+
+# Save submission file
+write.csv(submission_r, "rf_submission.csv", row.names = FALSE)
+
+```
+
+
+### XGBoost Model 
+
+This code performs hyperparameter tuning for an XGBoost model using a grid search approach. By tuning these parameters, we can prevent overfitting and improve the model's ability to generalize to new data. For example, in the given tune_grid, the max_depth, min_child_weight, and gamma hyperparameters control the depth and structure of each tree in the XGBoost model, while the subsample and colsample_bytree hyperparameters control the amount of data and features used in each boosting round. The eta hyperparameter controls the learning rate of the model and can help prevent overfitting by slowing down the rate of learning. The XGBoost model so far gives the best result with 0.7177503 AUC score.
+
+```{r message=FALSE, warning=FALSE}
+# XGBoost
+tune_grid <- expand.grid(
+  nrounds = c(500, 1000),
+  max_depth = c(2, 4, 6),
+  eta = c(0.1, 0.07),
+  gamma = 0.01,
+  colsample_bytree = 0.5,
+    min_child_weight = 1,
+  subsample = 0.5
+)
+
+control <- trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = FALSE,
+  returnData = FALSE,
+  returnResamp = "final",
+  classProbs = TRUE,
+  summaryFunction = prSummary,
+  allowParallel = TRUE
+)
+# create a new column with "yes" and "no" values based on the original column
+news_train$is_popular <- ifelse(news_train$is_popular == 1, "yes", "no")
+news_test$is_popular  <- ifelse(news_test$is_popular == 1, "yes", "no")
+
+# Check levels of response variable
+levels(news_train$is_popular)
+
+
+# Train the XGBoost model
+xgboost <- caret::train(
+  formula,
+  data = news_train,
+  method = "xgbTree",
+  trControl = control,
+  tuneGrid = tune_grid,
+  metric = "AUC"
+)
+
+# calculate AUC on training and test sets
+train_prob <- predict(xgboost, newdata = news_train, type = "prob")[, 2]
+test_prob <- predict(xgboost, newdata = news_test, type = "prob")[, 2]
+train_auc <- as.numeric(calculateAUC(train_prob, y_train))
+test_auc <- as.numeric(calculateAUC(test_prob, y_test))
+
+# add AUC results to table
+auc_results <- add_row(auc_results,
+  model = "XGBoost",
+  train = train_auc,
+  test = test_auc
+)
+
+# print the updated auc_results table
+kable(auc_results) %>% kable_styling(latex_options = c("HOLD_position", "resizebox=2.5\\textwidth"), font_size = 12, full_width = T)
+
+
+# Make predictions on test data
+test_pred <- predict(xgboost, newdata = test, type = "prob")[, 2]
+
+
+
+# Create submission file with two columns
+submission_x <- data.frame(article_id = test$article_id, score = test_pred)
+
+# Save submission file
+write.csv(submission_x, "rf_submission.csv", row.names = FALSE)
+
+
+
+```
+
+### Stacking
+Since random forest and XGBoost models have improved the AUC results by assigning weights to predictions of both models. Since the XGBoost model performs better, I gave more weight to the predictions of this model with 70% weight. This model gives the best result on Kaggle leaderboard with 0.69725 AUC score. 
+
+```{r stacking, message=FALSE, warning=FALSE}
+
+# Create a new data frame with article IDs from test data
+submission_s <- data.frame(article_id = test$article_id, score = NA)
+
+# Generate predictions from stacked models and assign them to the 'score' column of the submission data frame
+submission_s$score <- predict(xgboost, newdata = test, type = "prob")[, 2] * 0.7 +
+                    predict(rf_model, data = test)$predictions[, 2] * 0.3
+
+# Save submission file
+write.csv(submission_s, "submission_stacked.csv", row.names = FALSE)
+
+
+
+```
+
+### AutoML
+
+H2O has a built-in autoML feature that can do all the tuning and experimenting for us, running the AutoML model, it yields the best result with 0.7198334 AUC score; however it yields a public AUC score of 0.69161 on the Kaggle leader board which slightly worse than the stacked model, and the stacked model generalizes better to the new data.
+
+```{r AutoML, message=FALSE, warning=FALSE}
+# Train AutoML model with cross-validation predictions
+predictors <- setdiff(colnames(news_train), "is_popular")
+response <- "is_popular"
+automl <- h2o.automl(
+  x = predictors, 
+  y = response,
+  training_frame = news_train_h2o,
+  nfolds = 5,  # number of folds for cross-validation
+  keep_cross_validation_predictions = TRUE,  # keep cross-validation predictions
+  max_runtime_secs = 120  # maximum time in seconds
+)
+
+
+# Get AUC for training set
+train_perf <- h2o.performance(automl@leader, news_train_h2o)
+train_auc <- h2o.auc(train_perf)
+
+# Get AUC for test set
+test_perf <- h2o.performance(automl@leader, news_test_h2o)
+test_auc <- h2o.auc(test_perf)
+
+# Add AUC results to auc_results table
+auc_results <- auc_results %>%
+  add_row(
+    model = "AutoML",
+    train = train_auc,
+    test = test_auc
+  )
+kable(auc_results) %>% kable_styling(latex_options = c("HOLD_position", "resizebox=2.5\\textwidth"), font_size = 12, full_width = T)
+
+```
+
+## Deep Learning
+### Simple Deep Learning
+
+This is a simple learning model that uses only one hidden layer with 16 nodes. The resulting AUC score turned out to be worst than all other models with 0.6697305 on the test set, further hyper parameter tuning is required to improve the model performance.
+
+```{r message=FALSE, warning=FALSE}
+news_dl_simple <- h2o.deeplearning(
+    x = 1:40,
+    y = "is_popular",
+    training_frame = news_train_h2o,
+    validation_frame = news_test_h2o,
+    model_id = "news_dl_simple",
+    hidden = 16,
+    seed = my_seed
+)
+
+# Get AUC for news_dl_simple on training and validation frames
+train_perf <- h2o.performance(news_dl_simple, news_train_h2o)
+test_perf <- h2o.performance(news_dl_simple, news_test_h2o)
+train_auc <- h2o.auc(train_perf)
+test_auc <- h2o.auc(test_perf)
+
+# Add AUC results to auc_results table
+auc_results <- auc_results %>%
+  add_row(
+    model = "Simple Deep Learning",
+    train = train_auc,
+    test = test_auc
+  )
+kable(auc_results) %>% kable_styling(latex_options = c("HOLD_position", "resizebox=2.5\\textwidth"), font_size = 12, full_width = T)
+
+
+```
+
+
+### Deep Learning Tuned Model 2
+
+This model used RectifierWithDropout activation function with hidden drop out ratio of 0.2. The aim in here is to reduce overfitting by dropping some neurons randomly. 
+```{r message=FALSE, warning=FALSE}
+news_dl2 <- h2o.deeplearning(
+    x = 1:40,
+    y = "is_popular",
+    training_frame = news_train_h2o,
+    validation_frame = news_test_h2o,
+    model_id = "news_dl2",
+  activation = "RectifierWithDropout",
+    hidden_dropout_ratios = c(0.2, 0.2),
+    epochs = 70,
+    seed = my_seed
+)
+
+# Get AUC for news_dl_simple on training and validation frames
+train_perf <- h2o.performance(news_dl2, news_train_h2o)
+test_perf <- h2o.performance(news_dl2, news_test_h2o)
+train_auc <- h2o.auc(train_perf)
+test_auc <- h2o.auc(test_perf)
+
+# Add AUC results to auc_results table
+auc_results <- auc_results %>%
+  add_row(
+    model = "Deep Learning Tuned Model 2",
+    train = train_auc,
+    test = test_auc
+  )
+kable(auc_results) %>% kable_styling(latex_options = c("HOLD_position", "resizebox=2.5\\textwidth"), font_size = 12, full_width = T)
+
+```
+
+
+### Deep Learning Tuned Model 2
+
+This model is trained with 300 epochs, the score each parameter is is set to True meaning that model's performance is evaluated in each iteration.  I am also adding L1 regularization with a coefficient of 0.0001. The purpose of this model is to decrease complexity of the model by setting some weights closer or equal to zero in order to prevent over fitting.
+
+
+```{r message=FALSE, warning=FALSE}
+news_dl3 <- h2o.deeplearning(
+    x = 1:40,
+    y = "is_popular",
+    training_frame = news_train_h2o,
+    validation_frame = news_test_h2o,
+    model_id = "news_dl3",
+  activation = "RectifierWithDropout",
+    mini_batch_size= 20,
+    hidden_dropout_ratios = c(0.2, 0.2), 
+    l1 = 0.0001,
+    epochs = 300,
+    score_each_iteration = TRUE,
+    seed = my_seed
+)
+
+# Get AUC for news_dl_simple on training and validation frames
+train_perf <- h2o.performance(news_dl3, news_train_h2o)
+test_perf <- h2o.performance(news_dl3, news_test_h2o)
+train_auc <- h2o.auc(train_perf)
+test_auc <- h2o.auc(test_perf)
+
+# Add AUC results to auc_results table
+auc_results <- auc_results %>%
+  add_row(
+    model = "Deep Learning Tuned Model 3",
+    train = train_auc,
+    test = test_auc
+  )
+kable(auc_results) %>% kable_styling(latex_options = c("HOLD_position", "resizebox=2.5\\textwidth"), font_size = 12, full_width = T)
+
+
+```
+
+## Conclusion
+
+In this assignment, I tried different types of models and methods including linear models, random forest, gradient boosting, neural networks + parameter tuning, feature engineering, and stacking. The stacked random forest and xgboost models yielded the best results with 0.69725 AUC score on kaggle competition. 

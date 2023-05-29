@@ -1,0 +1,512 @@
+---
+title: "HW1-DS2"
+author: "Shahana Ayobi"
+date: '2023-03-18'
+output:
+  html_document:
+    df_print: paged
+  rmarkdown::html_document:
+    theme: lumen
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r - loading packages, include=FALSE}
+library(tidyverse)
+library(glmnet)
+library(rpart) 
+library(ranger)
+library(kableExtra)
+library(geosphere)
+library(stargazer)
+library(knitr)
+```
+
+
+# 1. Predict hotel reservation cancellations 
+
+## a.
+
+The goal of this task is to be better prepared for hotel reservation cancellation and minimize its impact on the revenue. A good evaluation metric for this could be recall which is the proportion of correctly identified cancellations out of all actual cancellations. Since we want to better prepare for cancellations, it is important to identify as many false negatives as possible in order to avoid overbooking. This is because false negative would mean that we predict a reservation will not be cancelled but it is actually cancelled, this will lead to overbooking and eventually revenue loss. As a result, a higher recall score indicates a better ability to identify cancelled reservations and avoid overbooking.
+
+```{r loading the hotel data, results="hide"}
+hotel_data <- read_csv("data/hotel_reservations/hotel_reservations.csv")
+hotel_data <- mutate(hotel_data, booking_status=factor(booking_status, levels = c("Not_Canceled", "Canceled")))
+hotel_data <- mutate(hotel_data, booking_status1= ifelse(booking_status=="Not_canceled", 0, 1))
+```
+
+## b.
+
+The data is split into train and test sets, and 80% is assigned to training, and the rest to test set for evaluation. To calculate accuracy, the function calculateACC first converts the prediction probablities into predicted classes of `Canceled` and `Not Canceled`using a threshold of 0.5, where values above 0.5 are classified as canceled and the values below as not canceled. Choosing a threshold of 0.5 is common for classification problems like this since if the threshold is set too high, the model may classify some true positives to negatives leading to a decrease in recall. Choosing a threshold is set too low, it might lead to the model being aggressive and classify true negatives as positives. Thus, a threshold of 0.5 makes more sense in this problem where the model will equally predict each class.
+
+
+```{r -splitting the data}
+set.seed(20230320)
+n_obs <- nrow(hotel_data)
+test_share <- 0.20
+
+test_indices <- sample(seq(n_obs), floor(test_share * n_obs))
+test <- slice(hotel_data, test_indices)
+train <- slice(hotel_data, -test_indices)
+```
+
+
+```{r -loss function}
+calculateACC <- function(prediction, y_true) {
+predicted_labels <- ifelse(prediction > 0.5, "Canceled", "Not_Canceled")
+accuracy <- mean(predicted_labels == y_true)
+return(accuracy)
+}
+```
+
+
+
+## c.
+
+In the benchmark model, it is assumed that no one will cancel their reservation. As a result, it achieved accuracy of 67.32% for training set and 66.86% for test set. The simple losgistic regression which includes only lead time and average price per room as predictors achieved an accuracy of 74.96% for training and 62.69% for training set. However, this is still not a good score and model can be improved with tuning and using more complex models.
+ 
+
+```{r -benchmark model, message=FALSE, warning=FALSE}
+ACCresults <- tibble(
+    model = " Zero cancellation",
+    train = calculateACC(0, train$booking_status),
+    test = calculateACC(0, test$booking_status)
+)
+ACCresults %>% kbl() %>% kable_styling(latex_options = c("HOLD_position", "resizebox=2.5\\textwidth"), font_size = 14) 
+```
+
+
+
+```{r -estimate-logit}
+simple_logit <- glm(
+   booking_status  ~ lead_time + avg_price_per_room,
+    data = train, family = binomial()
+)
+
+
+ACCresults <- add_row(ACCresults, 
+                      model = "Simple Logit",
+                      train = calculateACC(predict(simple_logit), train$booking_status), 
+                      test = calculateACC(predict(simple_logit), test$booking_status))
+ACCresults %>% kbl() %>% kable_styling(latex_options = c("HOLD_position", "resizebox=2.5\\textwidth"), font_size = 14) 
+```
+We can see from the coefficients that lead time and average price per room are both positively associated with the probability of hotel reservation being canceled. This means that as the lead time or average price per room increases, so does the probability of cancellation. 
+
+```{r -summary logit}
+summary_table <- summary(simple_logit)$coefficients
+kable(summary_table, align = c("l", rep("r", ncol(summary_table) - 1))) %>% kable_styling(latex_options = c("HOLD_position", "resizebox=2.5\\textwidth"), font_size = 14) 
+
+
+```
+
+## d.
+If the accuracy is 75% which is approximately true in our case, the remaining 25% represents the percentage of incorrect predictions made by the model. According to the confusion matrix below, the model correctly predicted 4408 "Not Canceled" bookings and 1127 "Canceled" bookings, but it incorrectly predicted 1277 "Canceled" bookings as "Not Canceled" and 443 "Not Canceled" bookings as "Canceled". Therefore, the remaining 25% is a combination of both false positives (443) and false negatives (1277). However, it is not evenly distributed, and we have more false negatives than false positives. As discussed earlier, a higher false negative rate would lead to revenue loss for the company. Therefore, it is better to optimize the model by adding more predictors or using flexible models.
+
+```{r -confusion matrix}
+# Generate predictions on the test set
+prediction <- predict(simple_logit, newdata = test, type = "response")
+
+# Convert probabilities to class labels (Canceled or Not_Canceled)
+predicted_labels <- ifelse(prediction > 0.5, "Canceled", "Not_Canceled")
+
+# Create a confusion matrix
+confusion_matrix <- table(predicted_labels, test$booking_status, dnn = c("Predicted", "Actual"))
+
+# Print the confusion matrix
+confusion_matrix %>% kbl() %>% kable_styling(latex_options = c("HOLD_position", "resizebox=2.5\\textwidth"), font_size = 14) 
+
+
+```
+
+## e.
+As discussed earlier, false negative is a more serious issue, this is because if the model predicts that a room booking is not canceled when it is actually canceled, the hotel will not release the room to other perspective customers, and will loose revenue because the model shows that the rooms are overbooked. This will also lead to negative customer experience because of the unavailability of rooms, and they may not book a room in this hotel in the future.
+
+## f, g.
+According to the table below, the simple tree model performs slightly better than the simple logistic regression model, with a training accuracy of 75.97% and a test accuracy of 76.25%. However, the random forest model outperforms both models, with a training accuracy of 91.67% and a test accuracy of 82.54 %. 
+
+This means that a more flexible model, such as random forest, is better suited to this problem than a linear or simple nonlinear model. The random forest model's higher accuracy can help reduce the number of false negatives, to avoid revenue loss and overbooking.
+
+```{r -simple_tree, results='hide'}
+simple_tree <- rpart(
+    booking_status  ~ lead_time + avg_price_per_room,
+    data = train,  method = "class"
+)
+
+# Make predictions on the train and test sets
+train_pred <- predict(simple_tree, newdata = train, type = "class")
+test_pred <- predict(simple_tree, newdata = test, type = "class")
+
+# Calculate accuracy on the train and test sets
+train_acc <- mean(train_pred == train$booking_status)
+test_acc <- mean(test_pred == test$booking_status)
+
+# Add the results to the ACCresults table
+ACCresults <- add_row(
+  ACCresults,
+  model = "Simple Tree",
+  train = train_acc,
+  test = test_acc
+)
+
+```
+
+```{r -random forest}
+
+# Fit a random forest model
+rf_model <- ranger(
+  booking_status ~ lead_time + avg_price_per_room,
+  data = train
+)
+
+# Make predictions on the train and test sets
+train_pred <- predict(rf_model, data = train)$predictions
+test_pred <- predict(rf_model, data = test)$predictions
+
+# Calculate accuracy on the train and test sets
+train_acc <- mean(train_pred == train$booking_status)
+test_acc <- mean(test_pred == test$booking_status)
+
+# Add the results to the ACCresults table
+ACCresults <- add_row(
+  ACCresults,
+  model = "Random Forest",
+  train = train_acc,
+  test = test_acc
+)
+
+ACCresults %>% kbl() %>% kable_styling(latex_options = c("HOLD_position", "resizebox=2.5\\textwidth"), font_size = 14) 
+```
+
+## h.
+
+Including the month of arrival, the flag indicating whether the customer is a repeated guest, and the total number of special requests made by the customers has noticeably improved the performance of the models, with the new random forest model showing the greatest improvement. The new Logistic regression model improved accuracy in training set to 77.07%, but the accuracy decreased to 61.30% in test set. The improved tree model significantly improved accuracy to 79.51% in the training set and 79.94% in the test. The accuracy of the improved random forest model decreased to 89.86% in the training set and 87.02% in the test which is by far the highest accuracy rate for the test set.
+
+## i.
+It is important to properly encode categorical variables when adding them to a model. In this case, the month of arrival and the flag indicating whether or not the customer is a repeated guest are encoded as factors, in order correctly include them in the model.
+
+```{r -improved logistic regression}
+# Fit the improved logistic regression model
+improved_logit <- glm(
+  booking_status ~ lead_time + avg_price_per_room + as.factor(arrival_month) + as.factor(repeated_guest) + no_of_special_requests,
+  data = train, family = binomial()
+)
+
+ACCresults <- add_row(ACCresults,
+  model = "Improved Logit",
+  train = calculateACC(predict(improved_logit), train$booking_status),
+  test = calculateACC(predict(improved_logit), test$booking_status)
+)
+```
+
+## j. 
+There could be two possible reasons why we did not add the year of arrival. First, because the dataset only contained two years (2017 and 2018), the booking behavior of customers might not differ significantly to include it as separate variable. Second, the model might interpret the years as continuous variable which would not make sense in this case.
+
+
+```{r improved decision tree model}
+
+# Fit an improved decision tree model
+improved_tree <- rpart(
+  booking_status ~ lead_time + avg_price_per_room + as.factor(arrival_month) + as.factor(repeated_guest) + no_of_special_requests,
+  data = train, method = "class"
+)
+
+# Generate predictions on the test and train sets
+train_pred <- predict(improved_tree, newdata = train, type = "class")
+test_pred <- predict(improved_tree, newdata = test, type = "class")
+train_acc <- mean(train_pred == train$booking_status)
+test_acc <- mean(test_pred == test$booking_status)
+
+# Add the results to the ACCresults table
+
+ACCresults <- add_row(ACCresults,
+                      model = "Improved Tree",
+                      train = train_acc, 
+                      test = test_acc)
+
+
+```
+
+
+```{r -Improved Random Forest}
+train$arrival_month <- as.factor(train$arrival_month)
+train$repeated_guest <- as.factor(train$repeated_guest)
+
+test$arrival_month <- as.factor(test$arrival_month)
+test$repeated_guest <- as.factor(test$repeated_guest)
+
+# Fit a random forest model
+improved_rf <- ranger(
+  booking_status ~ lead_time + avg_price_per_room + arrival_month + repeated_guest + no_of_special_requests,
+  data = train
+)
+
+
+# Generate predictions on the test and train sets
+train_pred <- predict(improved_rf, data = train)$predictions
+test_pred <- predict(improved_rf, data = test)$predictions
+train_acc <- mean(train_pred == train$booking_status)
+test_acc <- mean(test_pred == test$booking_status)
+
+# Add the results to the ACCresults table
+
+ACCresults <- add_row(ACCresults,
+                      model = "Improved Random Forest",
+                      train = train_acc, 
+                      test = test_acc)
+ACCresults %>%kbl() %>% kable_styling(latex_options = c("HOLD_position", "resizebox=2.5\\textwidth"), font_size = 14)
+```
+
+## k.
+Looking at the distribution of two variables: the number of previous bookings that were canceled and the number of previous bookings that were not canceled by the customer prior to the current booking, we can see that most of the values are zero. This means that the vast majority of customers have not made any previous bookings, canceled or not canceled. Including these variables in the model will not add any significant new information and may not improve model performance because they have little impact on the outcome.
+
+```{r out.width='50%', warning=FALSE, message=FALSE}
+library(tidyverse)
+fig1 <- ggplot(hotel_data, aes(no_of_previous_bookings_not_canceled)) + geom_histogram(fill= "maroon") + xlim(-1, 5) + labs(y = "Count", x = " Number of Previous Bookings (Not Canceled)", title = "Figure 1") + theme_bw()
+fig2 <- ggplot(hotel_data, aes(no_of_previous_cancellations)) + geom_histogram(fill="maroon") + xlim(-1, 5) + labs(y = "Count", x = " Number of Previous Bookings (Canceled)", title = "Figure 2") + theme_bw()
+```
+
+```{r out.width='50%', warning=FALSE, message=FALSE}
+fig1
+fig2
+```
+
+## l.
+According to the results, the best performing model on the test set is the "Improved Random Forest" model, which has an 87% test accuracy. This model has significantly higher test accuracy than the other models, which means we can generalize it to the new data.
+Before presenting the results to the CRO, I would run cross-validation on the Improved Random Forest model in order to see how well the model is generalizable to the new data. I would also look at the recall score to make sure that the model is correctly identifying all true positives and avoiding any false negatives.
+
+
+# 2. Predict real estate value
+
+The purpose of this exercise is to predict property prices in New Taipei City, Taiwan using the real_estate dataset with 414 observations and 8 variables. The goal is to build a simple web app where potential buyers and sellers could rate their homes. First, to find a predictive model, we will work with a 20% subsample of the original data and put aside 30% of that sample for the test set.
+
+## a.
+An appropriate loss function would be using RMSE in order to evaluate the predictive models. The lower the RMSE the better since it measures the average difference between the predicted property prices and the actual ones in the test set and in this case we are looking to correctly predict the property prices.
+Making a wrong prediction would lead to financial losses for both potential buyers and sellers. This is because they would rely on the model's price prediction while buying and selling properties. Therefore,it is important to choose a model with lowest RMSE to make sure that the predictive models provide accurate prices for those properties and avoid any potential losses for buyers and sellers.
+
+```{r loading the data, results='hide'}
+real_estate <- read_csv("data/real_estate/real_estate.csv")
+set.seed(20230320)
+real_estate_sample <- slice_sample(real_estate, prop = 0.2)
+n_obs <- nrow(real_estate_sample)
+test_share <- 0.3
+test_indices <- sample(seq(n_obs), floor(test_share * n_obs))
+real_estate_test <- slice(real_estate_sample, test_indices)
+real_estate_train <- slice(real_estate_sample, -test_indices)
+```
+
+```{r loss function}
+calculateRMSE <- function(prediction, y_true) {
+  sqrt(mean((prediction - y_true)^2))
+}
+
+```
+
+## b.
+The benchmark model uses the average house price of unit area. This could be a baseline to compare other complex models with. For the training and test sets, respectively, the mean difference of the predicted house prices based on the average value is around 11.66 and 13.29.
+
+```{r benchmark model, warning=FALSE, message=FALSE}
+avg <- mean(real_estate_train$house_price_of_unit_area)
+RMSEresults <- tibble(
+  model="Average",
+train = calculateRMSE(avg, real_estate_train$house_price_of_unit_area),
+holdout = calculateRMSE(avg, real_estate_test$house_price_of_unit_area))
+RMSEresults %>% kbl() %>% kable_styling(latex_options = c("HOLD_position", "resizebox=2.5\\textwidth"), font_size = 14) 
+
+```
+
+## c. 
+The Simple Linear model below takes `distance to the nearest MRT station` as a predictor for `house price of unit area`. The model performs better on the training set than the benchmark model, but worst on the holdout set, with an average RMSE value of 8.77 for the training set and 14.19 for the holdout set. Based on this result, I will not launch the web app now because RMSE is quite high for the holdout set. Therefore, It would make more sense to explore adding other predictors or using more flexible models to improve the prediction.
+
+
+```{r simple linear, message=FALSE, warning=FALSE}
+linear_model <- lm(house_price_of_unit_area ~ distance_to_the_nearest_MRT_station, 
+                   data = real_estate_train)
+
+RMSEresults <- RMSEresults %>% add_row(
+  model="Simple Linear",
+  train = calculateRMSE(predict(linear_model), real_estate_train$house_price_of_unit_area),
+  holdout = calculateRMSE(predict(linear_model), real_estate_test$house_price_of_unit_area)
+)
+
+```
+
+## d.
+
+In the multivariate regression, `distance_to_the_nearest_MRT_station`, `house_age`, and `number_of_convenience_stores` are added as predictors, and the model has an average RMSE value of 7.82 for the training set, which is lower than the simple linear regression model and benchmark model. However, the RMSE value for the holdout set is 14.47, which is higher than the simple linear regression model. This means that the model cannot be generalized to the new data. The issue with increasing holdout RMSE value might also be because we only have 24 observations, this makes the holdout set very sensitive to variations in the data which eventually causes RMSE to increase.
+For, now longitude and latitude are not added since we already have a variable that captures distance and adding them might cause multidisciplinary issues.
+
+```{r multivariate model, warning=FALSE, message=FALSE}
+multivariate_model <- lm(house_price_of_unit_area ~ distance_to_the_nearest_MRT_station + house_age + number_of_convenience_stores, 
+                   data = real_estate_train)
+
+RMSEresults <- add_row(RMSEresults, 
+                       model = "Multivariate Linear",
+                       train = calculateRMSE(predict(multivariate_model), real_estate_train$house_price_of_unit_area),
+                       holdout = calculateRMSE(predict(multivariate_model), real_estate_test$house_price_of_unit_area))
+RMSEresults %>% kbl() %>% kable_styling(latex_options = c("HOLD_position", "resizebox=2.5\\textwidth"), font_size = 14) 
+
+``` 
+
+## e.
+### Feature Engineering
+I added squares of `house_age`, `distance_to_the_nearest_MRT_station`, and `number_of_convenience_stores`, and interaction terms between these variables in order to capture the non-linear relationships between these variables and the response variable. I have also created a variable called `distance_to_city_center` which is each property's distance from the center. New Taipei's longitude and latitude for the city center were first defined and then the distm function was used to calculate the distance in kilometers. 
+These variables were added to the model, and now the train RMSE is 4.25 while the holdout RMSE value has increased to 15.76.
+
+### Training a more Flexible Model
+
+Training a Random Forest model significantly improves the results for both training and holdout sets. The holdout RMSE value is now 8.93, however, it is still higher and can be improved if we have more observations for the holdout set.
+```{r feature engineered model, message=FALSE, warning=FALSE}
+# Approach 1: Feature engineering
+# add squares and interactions of meaningful variables
+real_estate_train <- real_estate_train %>%
+  mutate(
+    house_age_sq = house_age^2,
+    dist_mrt_sq = distance_to_the_nearest_MRT_station^2,
+    conv_store_sq = number_of_convenience_stores^2,
+    house_age_dist_mrt = house_age * distance_to_the_nearest_MRT_station,
+    house_age_conv_store = house_age * number_of_convenience_stores,
+    dist_mrt_conv_store = distance_to_the_nearest_MRT_station * number_of_convenience_stores)
+
+
+library(geosphere)
+# Define the coordinates of the city center
+city_center_lat <-  25.105497
+city_center_lon <- 121.59736
+
+# Calculate the distance of each property to the city center
+real_estate_train$distance_to_city_center <- distm(
+  cbind(real_estate_train$longitude, real_estate_train$latitude),
+  cbind(city_center_lon, city_center_lat),
+  fun = distHaversine)/1000
+
+
+feature_engineered <- lm(house_price_of_unit_area ~ distance_to_the_nearest_MRT_station + house_age + number_of_convenience_stores + distance_to_city_center + house_age_sq + dist_mrt_sq + conv_store_sq + house_age_dist_mrt + house_age_conv_store + dist_mrt_conv_store, 
+                   data = real_estate_train)
+
+RMSEresults <- add_row(RMSEresults,
+                       model = "Feature Engineered Model",
+                       train = calculateRMSE(predict(feature_engineered), real_estate_train$house_price_of_unit_area), 
+                       holdout = calculateRMSE(predict(feature_engineered), real_estate_test$house_price_of_unit_area))
+
+
+```
+
+```{r random forest, message=FALSE, warning=FALSE}
+
+# Approach 2: Training more flexible models
+# use random forest and gradient boosting models
+library(ranger)
+
+# Random Forest
+set.seed(2023322)
+rf_model <- ranger(
+  house_price_of_unit_area ~ distance_to_the_nearest_MRT_station + house_age + number_of_convenience_stores , data = real_estate_train
+)
+
+RMSEresults <- add_row(RMSEresults,
+                       model = "Random Forest", 
+                          train = calculateRMSE(predict(rf_model, real_estate_train)$predictions, real_estate_train$house_price_of_unit_area), 
+                       holdout = calculateRMSE(predict(rf_model, real_estate_test)$predictions, real_estate_test$house_price_of_unit_area))
+RMSEresults %>% kbl() %>% kable_styling(latex_options = c("HOLD_position", "resizebox=2.5\\textwidth"), font_size = 14) 
+```
+
+## f. 
+Although the model is performing reasonably well, there is still room for improvement. Collecting and adding more data to train the models would improve the model's predictive power and we would be able to better capture the underlying patterns in the data. We may also use cross-validation to improve model's performance and make sure that the model is not over fitting the training set, and make the model more generalizable to the new data.
+
+
+```{r}
+# merge the train and test sets to get the full dataset
+real_estate_full_train <- anti_join(real_estate, real_estate_test)
+
+```
+
+```{r linear_full_model, message=FALSE, warning=FALSE}
+linear_full_model <- lm(house_price_of_unit_area ~ distance_to_the_nearest_MRT_station, 
+                   data = real_estate_full_train)
+
+RMSEresults <- RMSEresults %>% add_row(
+  model="Simple Linear Full",
+  train = calculateRMSE(predict(linear_model), real_estate_full_train$house_price_of_unit_area),
+  holdout = calculateRMSE(predict(linear_model), real_estate_test$house_price_of_unit_area)
+)
+
+
+```
+
+```{r multivariate_model_full, message=FALSE, warning=FALSE}
+multivariate_model_full <- lm(house_price_of_unit_area ~ distance_to_the_nearest_MRT_station + house_age + number_of_convenience_stores + latitude + longitude, 
+                   data = real_estate_full_train)
+
+RMSEresults <- add_row(RMSEresults, 
+                       model = "Multivariate Linear Full",
+                       train = calculateRMSE(predict(multivariate_model), real_estate_full_train$house_price_of_unit_area),
+                      holdout = calculateRMSE(predict(multivariate_model), real_estate_test$house_price_of_unit_area))
+
+```
+
+```{r feature_engineered_full, message=FALSE, warning=FALSE}
+# Approach 1: Feature engineering
+# add squares and interactions of meaningful variables
+real_estate_full_train <- real_estate_full_train %>%
+  mutate(
+    house_age_sq = house_age^2,
+    dist_mrt_sq = distance_to_the_nearest_MRT_station^2,
+    conv_store_sq = number_of_convenience_stores^2,
+    house_age_dist_mrt = house_age * distance_to_the_nearest_MRT_station,
+    house_age_conv_store = house_age * number_of_convenience_stores,
+    dist_mrt_conv_store = distance_to_the_nearest_MRT_station * number_of_convenience_stores)
+
+
+# Define the coordinates of the city center
+city_center_lat <-  25.105497
+city_center_lon <- 121.59736
+
+# Calculate the distance of each property to the city center
+real_estate_full_train$distance_to_city_center <- distm(
+  cbind(real_estate_full_train$longitude, real_estate_full_train$latitude),
+  cbind(city_center_lon, city_center_lat),
+  fun = distHaversine)/1000
+
+
+feature_engineered_full <- lm(house_price_of_unit_area ~ distance_to_the_nearest_MRT_station + house_age + number_of_convenience_stores + distance_to_city_center + house_age_sq + dist_mrt_sq + conv_store_sq + house_age_dist_mrt + house_age_conv_store + dist_mrt_conv_store, 
+                   data = real_estate_full_train)
+
+RMSEresults <- add_row(RMSEresults,
+                       model = "Feature Engineered Model Full",
+                       train = calculateRMSE(predict(feature_engineered), real_estate_full_train$house_price_of_unit_area), 
+                      holdout = calculateRMSE(predict(feature_engineered), real_estate_test$house_price_of_unit_area))
+
+```
+
+```{r random forest full, message=FALSE, warning=FALSE}
+# Random Forest
+set.seed(2023322)
+rf_model_full <- ranger(
+  house_price_of_unit_area ~ distance_to_the_nearest_MRT_station + house_age + number_of_convenience_stores + latitude + longitude, data = real_estate_full_train
+)
+
+RMSEresults <- add_row(RMSEresults,
+                       model = "Random Forest Full", 
+                          train = calculateRMSE(predict(rf_model, real_estate_full_train)$predictions, real_estate_full_train$house_price_of_unit_area), 
+                       holdout = calculateRMSE(predict(rf_model, real_estate_test)$predictions, real_estate_test$house_price_of_unit_area))
+RMSEresults %>% kbl() %>% kable_styling(latex_options = c("HOLD_position", "resizebox=2.5\\textwidth"), font_size = 14) 
+
+```
+
+## g.
+
+The models did not really improve after adding the whole data except for random forest model. Based on this improvement, I might consider to launch the web app only if I can make sure that the holdout set is representative of the data. Collecting more data might improve the models predictive power and will lead to even lower RSMSE value for holdout set.
+
+
+
+
+
+
+
+
+
+
+
+

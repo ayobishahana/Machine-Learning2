@@ -1,0 +1,162 @@
+---
+title: "HW2-HOTDOG"
+author: "Shahana Ayobi"
+date: '2023-04-08'
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+In this problem I am going to predict if a certain image containing food is hot dog or is something else. Motivation for this comes from the comedy show Silicon Valley (see here).
+The data can be found in the course repo and is originally downloaded from [here](https://www.kaggle.com/datasets/dansbecker/hot-dog-not-hot-dog). I will use the test data for validation.
+
+
+```{r loading packages-task2, message=FALSE, warning=FALSE, include=FALSE}
+library(knitr)
+library(keras)
+library(tensorflow)
+library(reticulate)
+reticulate::use_virtualenv("r-reticulate")
+library(gridExtra)
+```
+
+
+## a. 
+Show two images: one hot dog and one not hot dog. (Hint: You may use knitr::include_graphics() or install the imager package to easily accomplish this.)
+I am using the knitr::include_graphics() and loading the two random images from the train folder. 
+
+```{r two images, message=FALSE, out.width='50%'}
+
+knitr::include_graphics("archive-9/seefood/train//hot_dog/1000288.jpg")
+knitr::include_graphics("archive-9/seefood/train/not_hot_dog/100135.jpg")
+
+```
+
+
+## b.
+A better evaluation metric to define whether a picture is hot dog or not would be accuarcy since it gives the percentage of correctly classified images out of the total images. Accuracy is a popular metric for evaluating classification models because it measures the model's proportion of correct predictions. Because the classes in the dataset are balanced, it may be the best performance metric to use for this problem.
+
+
+## c.
+
+after defining the path to train and test directories, I created two data generators for the train and validation sets using the image_data_generator() function. The first generator train_datagen applies the rescaling of pixel values and dividing it by 255 to normalize the data. In this step I am not using any augmentation techniques.
+In the second generator train_datagen_aug, I apply a set of data augmentation techniques, such as rotation, width and height shifts, shear and zoom that I will use for later on the augmented CNN model.
+I then defined the flow_images_from_directory() function and read the images from the directories specified earlier.  This is to prepare them for the CNN models. I created two generators for training the models: train_generator, which uses the train_datagen generator and applies no data augmentation, and hotdog_train_aug, which uses the train_datagen_aug generator and applies data augmentation.
+
+```{r getting all the images, message=FALSE, warning=FALSE}
+my_seed <- 20230406
+
+train_dir <- "archive-9/seefood/train/"
+test_dir <- "archive-9/seefood/test/"
+
+# creating the data generators
+train_datagen <- image_data_generator(
+  rescale = 1/255
+)
+
+train_datagen_aug <- image_data_generator(
+   rotation_range = 20,
+    width_shift_range = 0.1,
+    height_shift_range = 0.1,
+    shear_range = 0.1,
+    zoom_range = 0.1)
+
+valid_datagen <- image_data_generator(rescale = 1/255)
+
+train_generator <- flow_images_from_directory(
+  train_dir,
+  target_size = c(128, 128),
+  batch_size = 64,
+  class_mode = "binary",
+  seed = my_seed
+  
+)
+
+
+hotdog_train_aug <- flow_images_from_directory(
+  train_dir, 
+   target_size = c(128, 128),
+  batch_size = 64,
+  class_mode = "binary",
+  seed = my_seed,
+  generator = train_datagen_aug
+)
+
+valid_generator <- flow_images_from_directory(
+  test_dir,
+  target_size = c(128, 128),
+  batch_size = 64,
+  class_mode = "binary",
+  seed = my_seed
+)
+
+```
+## c.
+
+To classify whether an image is hot dog or not, the simple CNN model consists of three convolutional layers with 32, 64, and 128 filters correspondingly, followed by maximum pooling layers, a fully connected layer, dropout layer of 0.4 to avoid overfitting and a final output layer with with single neuron and sigmoid activation function which is used for such kind of binary classification problems.
+The training result for the simple CNN model shows that the model achieved a training accuracy of 99%   and validation accuracy of 56.4% that suggest that the model is overfitting the training data, but it is not able to generalize well to the new data.
+
+
+```{r simple cnn, warning=FALSE, message=FALSE}
+cnn_model_simple <- keras_model_sequential() %>%
+  layer_conv_2d(filters = 32, kernel_size = c(3, 3), activation = 'relu', input_shape = c(128, 128, 3)) %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 64, kernel_size = c(3, 3), activation = 'relu') %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+   layer_conv_2d(filters = 128, kernel_size = c(3, 3), activation = 'relu') %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_flatten() %>% 
+  layer_dense(units = 55, activation = "relu") %>% 
+  layer_dropout(rate = 0.4) %>% 
+  layer_dense(units = 1, activation = 'sigmoid')
+
+cnn_model_simple %>% 
+  keras::compile(loss = 'binary_crossentropy', optimizer = "adam", metrics = 'accuracy')
+
+# Fit simple CNN model
+history_simple <- fit(cnn_model_simple, train_generator, epochs = 50,  validation_data = valid_generator)
+history_simple
+
+```
+
+## d. 
+
+To classify whether an image is a hot dog or not, the augmented CNN model uses more complex additional convolutional layer and data augmentation techniques applied during training.
+
+The additional convolutional layer applies 256 filters of size 3x3 to the output of the third max pooling layer, followed by a max pooling layer with a pool size of 2x2. The output is then flattened and passed through a fully connected layer with 128 neurons and the ReLU activation function. A dropout layer with a rate of 0.5 is applied to prevent overfitting, followed by a final output layer with a single neuron and the sigmoid activation function.
+
+During training, data augmentation techniques such as rotation, width shift, height shift, shear, and zoom are applied to the training images to increase the size and diversity of the training set. The training results show that cnn_model_aug achieved a lower training accuracy of 77.91%, but a higher validation accuracy of 60.2%, indicating better generalization to new data compared to cnn_model_simple.
+Overall, the results suggest that data augmentation techniques can help improve the performance of CNN models for image classification tasks. However, further optimization of the model architecture and hyperparameters may be necessary to achieve even better performance.
+
+```{r cnn with augmentation, warning=FALSE, message=FALSE}
+# CNN model with augmentation
+cnn_model_aug <- keras_model_sequential() %>%
+  layer_conv_2d(filters = 32, kernel_size = c(3, 3), activation = 'relu', input_shape = c(128, 128, 3)) %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 64, kernel_size = c(3, 3), activation = 'relu') %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+   layer_conv_2d(filters = 128, kernel_size = c(3, 3), activation = 'relu') %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 256, kernel_size = c(3, 3), activation = "relu") %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_flatten() %>% 
+  layer_dense(units = 128, activation = "relu") %>% 
+  layer_dropout(rate = 0.5) %>% 
+  layer_dense(units = 1, activation = 'sigmoid')
+
+cnn_model_aug %>% 
+  keras::compile(loss = 'binary_crossentropy', optimizer = "adam", metrics = "accuracy")
+
+# Fit CNN model with augmentation
+history_aug <- fit(cnn_model_aug, hotdog_train_aug, epochs =  50, validation_data = valid_generator)
+history_aug
+
+```
+
+
+
+
+
+
